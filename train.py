@@ -39,71 +39,107 @@ class DeltaTDataset(Dataset):
     def __init__(self, file_list, config, is_train=True):
         self.seq_len = config['seq_len']
         self.roi = config['roi']
-        self.samples = []
 
         print(f"🔄 正在加载 {'训练' if is_train else '测试'} 数据...")
 
-        # 使用 tqdm 显示文件加载总进度
+        # 1. 临时列表收集数据 (只存 Numpy 数组，减少对象开销)
+        temp_data_list = []
+        temp_label_list = []
+
+        # 使用 tqdm 显示进度
         for file_path in tqdm(file_list, desc="Loading Files"):
             try:
+                # ... (解析文件名和读取 CSV 的代码保持不变) ...
                 # 1. 解析文件名
                 basename = os.path.basename(file_path)
                 velocity_str = basename.split('_')[0].replace('mm', '')
                 label = float(velocity_str)
 
-                # 2. 读取 CSV (🌟 修复：尝试多种编码)
-                # 很多工业相机生成的CSV是 GBK 或 ISO-8859-1 编码
+                # 2. 读取 CSV (兼容性读取)
                 try:
                     df = pd.read_csv(file_path, header=None, usecols=[0, 1, 2],
                                      names=['row', 'col', 't_in'], encoding='utf-8')
-                except UnicodeDecodeError:
+                except:
                     try:
                         df = pd.read_csv(file_path, header=None, usecols=[0, 1, 2],
                                          names=['row', 'col', 't_in'], encoding='gbk')
-                    except UnicodeDecodeError:
-                        df = pd.read_csv(file_path, header=None, usecols=[0, 1, 2],
-                                         names=['row', 'col', 't_in'], encoding='latin1')
+                    except:
+                        continue
 
                 # 3. ROI 过滤
                 mask = (df['row'] >= self.roi['row_min']) & (df['row'] <= self.roi['row_max']) & \
                        (df['col'] >= self.roi['col_min']) & (df['col'] <= self.roi['col_max'])
-
                 valid_data = df[mask]
 
-                if len(valid_data) < self.seq_len:
+                # 4. 核心逻辑: 按像素排序 + 分组差分
+                # (这里使用之前提供的"先按坐标排"的正确逻辑)
+                data_val = valid_data.values
+                if len(data_val) < 2: continue
+
+                # 排序: Time(2), Col(1), Row(0)
+                sort_idx = np.lexsort((data_val[:, 2], data_val[:, 1], data_val[:, 0]))
+                sorted_data = data_val[sort_idx]
+
+                # 差分
+                diffs = sorted_data[1:] - sorted_data[:-1]
+
+                # 筛选同像素事件 (d_row==0 & d_col==0)
+                valid_pixel_mask = (diffs[:, 0] == 0) & (diffs[:, 1] == 0)
+                true_isi = diffs[valid_pixel_mask, 2]
+
+                # 剔除异常值
+                true_isi = true_isi[true_isi > 0]
+
+                if len(true_isi) < self.seq_len:
                     continue
 
-                # 4. 提取时间戳并排序
-                t_seq = valid_data['t_in'].values.astype(np.float32)
-                t_seq = np.sort(t_seq)
+                # Log 变换 (强制转为 float32 以省内存)
+                delta_t = np.log1p(true_isi).astype(np.float32)
 
-                # 5. 计算 Delta T
-                delta_t = np.diff(t_seq)
-
-                # 6. Log 变换
-                delta_t = np.log1p(delta_t)
-
-                # 7. 切分样本
+                # 切分
                 num_samples = len(delta_t) // self.seq_len
                 for i in range(num_samples):
                     segment = delta_t[i * self.seq_len: (i + 1) * self.seq_len]
-                    self.samples.append({
-                        'data': segment,
-                        'label': label
-                    })
+
+                    # 存入临时列表
+                    temp_data_list.append(segment)
+                    temp_label_list.append(label)
 
             except Exception as e:
-                print(f"⚠️ 严重错误跳过文件 {file_path}: {e}")
+                pass  # 忽略错误文件
 
-        print(f"✅ 加载完成: 共 {len(self.samples)} 个样本")
+        # 2. 🌟 关键优化：将列表转换为紧凑的 Tensor 🌟
+        # 这会释放掉列表产生的巨大额外开销
+        print("⚡️ 正在进行内存压缩 (List -> Tensor)...")
+        if len(temp_data_list) > 0:
+            # data_tensor 本来就是从 numpy 转过来的，保持 np.float32 没问题（torch.from_numpy 会自动推断）
+            self.data_tensor = torch.from_numpy(np.array(temp_data_list, dtype=np.float32))
+
+            # label_tensor 是直接用 torch.tensor 创建的，必须用 torch.float32
+            self.label_tensor = torch.tensor(temp_label_list, dtype=torch.float32)  # ✅ 修正为 torch.float32
+
+            # 标签归一化 (直接在 Tensor 上操作)
+            # 假设最大流速 2.5
+            self.label_tensor = self.label_tensor / 2.5
+        else:
+            self.data_tensor = torch.empty(0)
+            self.label_tensor = torch.empty(0)
+
+        # 手动清理临时列表，立刻释放内存
+        del temp_data_list
+        del temp_label_list
+        import gc
+        gc.collect()
+
+        print(f"✅ 加载完成: 共 {len(self.data_tensor)} 个样本")
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.data_tensor)
 
     def __getitem__(self, idx):
-        item = self.samples[idx]
-        x = torch.from_numpy(item['data']).float().unsqueeze(0)
-        y = torch.tensor([item['label']], dtype=torch.float32)
+        # 直接从 Tensor 取数，速度极快且不占额外内存
+        x = self.data_tensor[idx].unsqueeze(0)  # [1, seq_len]
+        y = self.label_tensor[idx].unsqueeze(0)  # [1]
         return x, y
 
 
@@ -156,7 +192,35 @@ def train():
         print("❌ 未找到数据文件，请检查路径！")
         return
 
-    train_files, val_files = train_test_split(all_files, test_size=0.2, random_state=42)
+    train_files = []
+    val_files = []
+
+    print("🔄 正在按文件名规则切分数据集...")
+    for f in all_files:
+        basename = os.path.basename(f)
+        # 文件名格式: 0.2_1_clip.csv
+        # parts: ['0.2', '1', 'clip.csv']
+        try:
+            parts = basename.split('_')
+            group_idx = parts[1]  # 获取中间那个数字 '1', '2', '3'
+
+            if group_idx == '3':
+                val_files.append(f)  # 第3组用于验证
+            else:
+                train_files.append(f)  # 第1、2组用于训练
+        except IndexError:
+            print(f"⚠️ 文件名格式异常，跳过: {basename}")
+            continue
+
+    print(f"📊 数据集切分结果:")
+    print(f"   - 训练集文件数: {len(train_files)} (包含 _1, _2)")
+    print(f"   - 验证集文件数: {len(val_files)}   (包含 _3)")
+
+    # 安全检查
+    if len(train_files) == 0 or len(val_files) == 0:
+        print("❌ 切分失败！请检查文件名是否包含 _1, _2, _3 结构。")
+        return
+
 
     train_ds = DeltaTDataset(train_files, CONFIG, is_train=True)
     val_ds = DeltaTDataset(val_files, CONFIG, is_train=False)
@@ -229,7 +293,7 @@ def train():
     plt.ylabel('MSE Loss')
     plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.savefig('training_curve.png')
+    plt.savefig('/data/zm/12.30/training_curve.png')
     print("\n✅ 训练结束！收敛图已保存至 training_curve.png")
 
 

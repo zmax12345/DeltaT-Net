@@ -1,26 +1,22 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from train import DeltaTDataset, CONFIG, glob
+import pandas as pd
+import glob
 import os
+from train import CONFIG
 
-search_path = os.path.join(CONFIG['data_dir'], CONFIG['file_pattern'])
-all_files = glob.glob(search_path)
+file_path = glob.glob(os.path.join(CONFIG['data_dir'], CONFIG['file_pattern']))[0]
+print(f"正在分析空间分布: {file_path}")
 
-corrs = []
-labels = []
+df = pd.read_csv(file_path, header=None, usecols=[0, 1], names=['row', 'col'])
+# 筛选 ROI
+df = df[(df['row']>=400)&(df['row']<=499)&(df['col']>=0)&(df['col']<=1280)]
 
-for f in all_files[:200]:
-    ds = DeltaTDataset([f], CONFIG, is_train=False)
-    for s in ds.samples[:200]:
-        dt = np.exp(np.array(s['data']))
-        if len(dt) > 5:
-            c = np.corrcoef(dt[:-1], dt[1:])[0,1]
-            corrs.append(c)
-            labels.append(s['label'])
-
-plt.figure(figsize=(6,5))
-plt.scatter(labels, corrs, s=2, alpha=0.5)
-plt.xlabel('Velocity or τc label')
-plt.ylabel('corr(Δt_i, Δt_{i+1})')
-plt.title('Temporal Correlation vs Label')
-plt.show()
+plt.figure(figsize=(10, 4))
+plt.hist(df['col'], bins=128, color='purple', alpha=0.7)
+plt.xlabel('Column Index (0-1280)')
+plt.ylabel('Event Count')
+plt.title('Spatial Event Distribution (Check for Non-uniformity)')
+plt.grid(True, alpha=0.3)
+plt.savefig('/data/zm/12.30/check_spatial_result.png')
+print("✅ 空间分布图已保存至 check_spatial_result.png")
